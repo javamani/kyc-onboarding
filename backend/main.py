@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 import os
 from motor.motor_asyncio import AsyncIOMotorClient
+from paddleocr import PaddleOCR
 from bson import ObjectId
 
 # Import OCR, NLP, and Validation modules
@@ -58,7 +59,8 @@ async def startup_db_client():
     await db.kyc_cases.create_index("status")
     
     # Initialize OCR, NLP, and Validation processors
-    ocr_processor = OCRProcessor(use_gpu=False, lang='en')
+    #ocr_processor = OCRProcessor(use_gpu=False, lang='en')
+    ocr_processor = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
     nlp_extractor = NLPEntityExtractor(model_name='en_core_web_sm')
     validation_scorer = ValidationRiskScorer()
     
