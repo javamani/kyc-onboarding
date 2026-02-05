@@ -11,7 +11,7 @@ from paddleocr import PaddleOCR
 from bson import ObjectId
 
 # Import OCR, NLP, and Validation modules
-from ocr_processor import OCRProcessor
+from ocr_processor import PaddleOCRProcessor
 from nlp_extractor import NLPEntityExtractor, process_document_with_nlp
 from validation_scorer import ValidationRiskScorer, format_validation_report
 
@@ -59,8 +59,7 @@ async def startup_db_client():
     await db.kyc_cases.create_index("status")
     
     # Initialize OCR, NLP, and Validation processors
-    #ocr_processor = OCRProcessor(use_gpu=False, lang='en')
-    ocr_processor = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
+    ocr_processor = PaddleOCRProcessor(use_gpu=False, lang='en')
     nlp_extractor = NLPEntityExtractor(model_name='en_core_web_sm')
     validation_scorer = ValidationRiskScorer()
     
@@ -503,7 +502,7 @@ async def upload_document(
 @app.post("/api/cases/{case_id}/submit")
 async def submit_case(
     case_id: str,
-    request: CaseActionRequest,
+    request: CaseActionRequest = CaseActionRequest(),
     current_user: dict = Depends(get_current_user_with_db)
 ):
     """Submit a case for review (MAKER only)"""
@@ -655,6 +654,42 @@ async def reject_case(
     
     updated_case = await db.kyc_cases.find_one({"_id": ObjectId(case_id)})
     return case_helper(updated_case)
+
+@app.delete("/api/cases/{case_id}")
+async def delete_case(
+    case_id: str,
+    current_user: dict = Depends(get_current_user_with_db)
+):
+    """Delete a case (for rollback when document upload fails)"""
+    if not ObjectId.is_valid(case_id):
+        raise HTTPException(status_code=400, detail="Invalid case ID")
+    
+    case = await db.kyc_cases.find_one({"_id": ObjectId(case_id)})
+    
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    
+    # Only the creator can delete their own draft cases
+    if case["created_by"] != current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete your own cases"
+        )
+    
+    # Only allow deletion of DRAFT cases (for rollback purposes)
+    if case["status"] != CaseStatus.DRAFT:
+        raise HTTPException(
+            status_code=400,
+            detail="Can only delete DRAFT cases"
+        )
+    
+    # Delete the case
+    await db.kyc_cases.delete_one({"_id": ObjectId(case_id)})
+    
+    return {
+        "message": "Case deleted successfully",
+        "case_id": case_id
+    }
 
 @app.get("/api/audit/{case_id}")
 async def get_audit_trail(

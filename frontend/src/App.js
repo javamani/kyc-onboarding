@@ -172,13 +172,14 @@ const KYCOnboardingApp = () => {
     }
   };
 
+  // Modified uploadDocument to return result instead of showing alerts immediately
   const uploadDocument = async (caseId, docType, file) => {
     const formDataToSend = new FormData();
     formDataToSend.append('doc_type', docType);
     formDataToSend.append('file', file);
 
     try {
-      setUploadProgress({ ...uploadProgress, [docType]: 'uploading' });
+      setUploadProgress(prev => ({ ...prev, [docType]: 'uploading' }));
       
       const token = localStorage.getItem('token');
       const response = await fetch(`${API_BASE}/cases/${caseId}/upload`, {
@@ -189,31 +190,54 @@ const KYCOnboardingApp = () => {
 
       if (response.ok) {
         const result = await response.json();
-        setUploadProgress({ ...uploadProgress, [docType]: 'success' });
-        
-        const riskInfo = result.risk_assessment || {};
-        alert(`✅ Document processed!\n\nOCR Confidence: ${(result.ocr_confidence * 100).toFixed(1)}%\nData Match: ${(result.data_match_score * 100).toFixed(1)}%\n\n🛡️ Risk Assessment:\nRisk Level: ${riskInfo.risk_level || 'N/A'}\nRisk Score: ${riskInfo.risk_score || 'N/A'}/100\nValid: ${riskInfo.is_valid ? 'Yes' : 'No'}\nAnomalies: ${riskInfo.anomalies_count || 0}`);
-        
-        fetchCases();
+        setUploadProgress(prev => ({ ...prev, [docType]: 'success' }));
+        return { success: true, data: result, docType };
       } else {
         const error = await response.json();
-        setUploadProgress({ ...uploadProgress, [docType]: 'error' });
-        alert(`Error: ${error.detail}`);
+        setUploadProgress(prev => ({ ...prev, [docType]: 'error' }));
+        return { success: false, error: error.detail || 'Upload failed', docType };
       }
     } catch (error) {
-      setUploadProgress({ ...uploadProgress, [docType]: 'error' });
+      setUploadProgress(prev => ({ ...prev, [docType]: 'error' }));
       console.error('Error uploading document:', error);
+      return { success: false, error: error.message || 'Upload failed', docType };
     }
   };
 
+  // Helper function to delete a case if uploads fail
+  const deleteCase = async (caseId) => {
+    try {
+      const token = localStorage.getItem('token');
+      await fetch(`${API_BASE}/cases/${caseId}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      console.log(`Case ${caseId} deleted due to upload failure`);
+    } catch (error) {
+      console.error('Error deleting case:', error);
+    }
+  };
+
+  // Modified createCase function with proper error handling
   const createCase = async () => {
     if (!formData.customerName || !formData.dob || !formData.address) {
       alert('Please fill all required fields');
       return;
     }
 
+    // Check if at least one document is selected
+    const hasDocuments = Object.values(documents).some(doc => doc !== null);
+    if (!hasDocuments) {
+      alert('⚠️ Please upload at least one document before creating the case');
+      return;
+    }
+
+    let createdCaseId = null;
+
     try {
       setLoading(true);
+      
+      // Step 1: Create the case
       const response = await fetch(`${API_BASE}/cases`, {
         method: 'POST',
         headers: getAuthHeaders(),
@@ -226,29 +250,76 @@ const KYCOnboardingApp = () => {
         })
       });
 
-      if (response.ok) {
-        const newCase = await response.json();
-        
-        for (const [docType, file] of Object.entries(documents)) {
-          if (file) {
-            await uploadDocument(newCase.id, docType, file);
+      if (!response.ok) {
+        const error = await response.json();
+        alert(`Error creating case: ${error.detail}`);
+        return;
+      }
+
+      const newCase = await response.json();
+      createdCaseId = newCase.id;
+      
+      // Step 2: Upload all documents and track results
+      const uploadResults = [];
+      let allUploadsSuccessful = true;
+
+      for (const [docType, file] of Object.entries(documents)) {
+        if (file) {
+          const result = await uploadDocument(createdCaseId, docType, file);
+          uploadResults.push(result);
+          
+          if (!result.success) {
+            allUploadsSuccessful = false;
           }
         }
-        
-        setFormData({ customerName: '', dob: '', address: '', email: '', phone: '' });
-        setDocuments({ pan: null, aadhaar: null, passport: null });
-        setUploadProgress({});
-        
-        alert('✅ Case created successfully!');
-        setActiveTab('list');
-        fetchCases();
-      } else {
-        const error = await response.json();
-        alert(`Error: ${error.detail}`);
       }
+
+      // Step 3: Check if all uploads were successful
+      if (!allUploadsSuccessful) {
+        // Delete the case if any upload failed
+        await deleteCase(createdCaseId);
+        
+        // Show detailed error message
+        const failedUploads = uploadResults
+          .filter(r => !r.success)
+          .map(r => `${r.docType.toUpperCase()}: ${r.error}`)
+          .join('\n');
+        
+        alert(`❌ Case creation cancelled due to document upload failures:\n\n${failedUploads}\n\nPlease try again.`);
+        
+        // Reset upload progress
+        setUploadProgress({});
+        return;
+      }
+
+      // Step 4: All uploads successful - show success summary
+      const successSummary = uploadResults
+        .filter(r => r.success)
+        .map(r => {
+          const riskInfo = r.data.risk_assessment || {};
+          return `✅ ${r.docType.toUpperCase()}:\n  OCR Confidence: ${(r.data.ocr_confidence * 100).toFixed(1)}%\n  Data Match: ${(r.data.data_match_score * 100).toFixed(1)}%\n  Risk Level: ${riskInfo.risk_level || 'N/A'} (${riskInfo.risk_score || 'N/A'}/100)`;
+        })
+        .join('\n\n');
+
+      alert(`🎉 Case created successfully!\n\nCase ID: ${createdCaseId}\n\n${successSummary}`);
+
+      // Reset form and navigate to list
+      setFormData({ customerName: '', dob: '', address: '', email: '', phone: '' });
+      setDocuments({ pan: null, aadhaar: null, passport: null });
+      setUploadProgress({});
+      setActiveTab('list');
+      fetchCases();
+
     } catch (error) {
       console.error('Error creating case:', error);
-      alert('Failed to create case');
+      
+      // If case was created but something went wrong, delete it
+      if (createdCaseId) {
+        await deleteCase(createdCaseId);
+      }
+      
+      alert('❌ Failed to create case. Please try again.');
+      setUploadProgress({});
     } finally {
       setLoading(false);
     }
@@ -259,12 +330,11 @@ const KYCOnboardingApp = () => {
       setLoading(true);
       const response = await fetch(`${API_BASE}/cases/${caseId}/submit`, {
         method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({})
+        headers: getAuthHeaders()
       });
 
       if (response.ok) {
-        alert('✅ Case submitted for review!');
+        alert('Case submitted successfully!');
         fetchCases();
       } else {
         const error = await response.json();
@@ -272,105 +342,99 @@ const KYCOnboardingApp = () => {
       }
     } catch (error) {
       console.error('Error submitting case:', error);
+      alert('Failed to submit case');
     } finally {
       setLoading(false);
     }
   };
 
   const reviewCase = async (caseId, action) => {
-    const endpoint = action === 'approve' ? 'approve' : 'reject';
-
+    const comments = prompt(`Enter ${action} comments (optional):`);
+    
     try {
       setLoading(true);
+      const endpoint = action === 'approve' ? 'approve' : 'reject';
       const response = await fetch(`${API_BASE}/cases/${caseId}/${endpoint}`, {
         method: 'POST',
         headers: getAuthHeaders(),
         body: JSON.stringify({
-          comments: action === 'reject' ? 'Documents require verification' : 'All checks passed'
+          action: action.toUpperCase(),
+          comments: comments || ''
         })
       });
 
       if (response.ok) {
-        alert(`✅ Case ${action}d successfully!`);
-        setSelectedCase(null);
+        alert(`Case ${action}d successfully!`);
         fetchCases();
       } else {
         const error = await response.json();
         alert(`Error: ${error.detail}`);
       }
     } catch (error) {
-      console.error(`Error ${action}ing case:`, error);
+      console.error('Error reviewing case:', error);
+      alert('Failed to review case');
     } finally {
       setLoading(false);
     }
   };
 
-  // ... (Include all the rendering helper functions from previous version)
-  const getRiskLevelColor = (level) => {
-    const colors = {
-      'VERY_LOW': 'risk-very-low',
-      'LOW': 'risk-low',
-      'MEDIUM': 'risk-medium',
-      'HIGH': 'risk-high',
-      'VERY_HIGH': 'risk-very-high'
-    };
-    return colors[level] || 'risk-medium';
-  };
-
   const getConfidenceColor = (score) => {
-    if (score >= 0.8) return 'confidence-high';
-    if (score >= 0.6) return 'confidence-medium';
+    if (score >= 0.9) return 'confidence-high';
+    if (score >= 0.7) return 'confidence-medium';
     return 'confidence-low';
   };
 
-  const renderOCRResults = (ocrResults) => {
-    if (!ocrResults || Object.keys(ocrResults).length === 0) {
-      return <p className="no-data">No OCR data available</p>;
-    }
+  const getRiskLevelColor = (level) => {
+    const colors = {
+      'LOW': 'risk-low',
+      'MEDIUM': 'risk-medium',
+      'HIGH': 'risk-high',
+      'CRITICAL': 'risk-critical'
+    };
+    return colors[level] || '';
+  };
 
+  const renderOCRResults = (ocrResults) => {
     return (
-      <div className="ocr-results-container">
+      <div className="ocr-results">
         {Object.entries(ocrResults).map(([docType, data]) => (
-          <div key={docType} className="ocr-result-card">
-            <div className="ocr-header">
-              <h5 className="doc-type">{docType.toUpperCase()}</h5>
-              <div className="confidence-badge">
-                <Award size={16} />
-                <span className={getConfidenceColor(data.confidence_score)}>
-                  {(data.confidence_score * 100).toFixed(1)}% Confidence
+          <div key={docType} className="ocr-section">
+            <h5>{docType.toUpperCase()}</h5>
+            <div className="ocr-data">
+              {Object.entries(data.extracted_data || {}).map(([key, value]) => (
+                <div key={key} className="ocr-field">
+                  <span className="ocr-label">{key}:</span>
+                  <span className="ocr-value">{value}</span>
+                </div>
+              ))}
+              <div className="ocr-confidence">
+                <span className={getConfidenceColor(data.confidence)}>
+                  Confidence: {
+      !isNaN(Number(data.confidence))
+        ? (Number(data.confidence) * 100).toFixed(1) + '%'
+        : 'N/A'
+    }
                 </span>
               </div>
-            </div>
-
-            {data.extracted_fields && (
-              <div className="extracted-fields">
-                <p className="section-title">Extracted Fields:</p>
-                <div className="fields-grid">
-                  {Object.entries(data.extracted_fields).map(([key, value]) => (
-                    value && (
-                      <div key={key} className="field-item">
-                        <span className="field-label">{key}:</span>
-                        <span className="field-value">{value}</span>
-                      </div>
-                    )
-                  ))}
+              {data.anomalies && data.anomalies.length > 0 && (
+                <div className="anomalies">
+                  <AlertTriangle size={16} />
+                  <span>Anomalies: {data.anomalies.join(', ')}</span>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         ))}
       </div>
     );
   };
 
-  // Login/Register Screen
+  // Authentication view
   if (!isAuthenticated) {
     return (
       <div className="auth-container">
         <div className="auth-card">
-          <h1>KYC Onboarding System</h1>
-          <p className="auth-subtitle">Secure Login & Registration</p>
-
+          <h1>🔐 KYC Onboarding System</h1>
           <div className="auth-tabs">
             <button
               className={authView === 'login' ? 'active' : ''}
@@ -389,7 +453,7 @@ const KYCOnboardingApp = () => {
           <form onSubmit={handleAuthSubmit} className="auth-form">
             {authView === 'register' && (
               <div className="form-group">
-                <label>Full Name *</label>
+                <label>Full Name</label>
                 <input
                   type="text"
                   name="full_name"
@@ -402,45 +466,39 @@ const KYCOnboardingApp = () => {
             )}
 
             <div className="form-group">
-              <label>Email *</label>
+              <label>Email</label>
               <input
                 type="email"
                 name="email"
                 value={authForm.email}
                 onChange={handleAuthInputChange}
                 required
-                placeholder="your@email.com"
+                placeholder="Enter your email"
               />
             </div>
 
             <div className="form-group">
-              <label>Password *</label>
+              <label>Password</label>
               <input
                 type="password"
                 name="password"
                 value={authForm.password}
                 onChange={handleAuthInputChange}
                 required
-                placeholder="Enter password"
-                minLength={6}
-                maxLength={72}
+                placeholder="Enter your password"
               />
-              <small style={{color: '#6b7280', fontSize: '0.75rem'}}>
-                6-72 characters
-              </small>
             </div>
 
             {authView === 'register' && (
               <div className="form-group">
-                <label>Role *</label>
+                <label>Role</label>
                 <select
                   name="role"
                   value={authForm.role}
                   onChange={handleAuthInputChange}
-                  required
                 >
-                  <option value="MAKER">MAKER (Create Cases)</option>
-                  <option value="CHECKER">CHECKER (Review Cases)</option>
+                  <option value="MAKER">Maker</option>
+                  <option value="CHECKER">Checker</option>
                 </select>
               </div>
             )}
@@ -452,8 +510,12 @@ const KYCOnboardingApp = () => {
               </div>
             )}
 
-            <button type="submit" className="btn btn-primary" disabled={loading}>
-              {loading ? 'Please wait...' : (authView === 'login' ? 'Login' : 'Register')}
+            <button
+              type="submit"
+              disabled={loading}
+              className="btn btn-primary"
+            >
+              {loading ? 'Processing...' : authView === 'login' ? 'Login' : 'Register'}
             </button>
           </form>
         </div>
@@ -461,13 +523,12 @@ const KYCOnboardingApp = () => {
     );
   }
 
-  // Main Application (after login)
   return (
     <div className="app-container">
       <header className="app-header">
         <div className="header-content">
           <div className="header-left">
-            <h1>KYC Onboarding System</h1>
+            <h1>🔐 KYC Onboarding System</h1>
             <p className="subtitle">with OCR & NLP Processing</p>
           </div>
           <div className="header-right">
@@ -488,26 +549,24 @@ const KYCOnboardingApp = () => {
         </div>
       </header>
 
-      {loading && (
-        <div className="loading-overlay">
-          <div className="loading-content">Processing...</div>
-        </div>
-      )}
-
       <main className="main-content">
         <div className="content-card">
           <div className="tabs">
-            <button
-              className={`tab ${activeTab === 'create' ? 'active' : ''}`}
-              onClick={() => setActiveTab('create')}
-            >
-              Create Case
-            </button>
+            {currentUser?.role === 'MAKER' && (
+              <button
+                className={`tab ${activeTab === 'create' ? 'active' : ''}`}
+                onClick={() => setActiveTab('create')}
+              >
+                <Upload size={18} />
+                Create Case
+              </button>
+            )}
             <button
               className={`tab ${activeTab === 'list' ? 'active' : ''}`}
               onClick={() => setActiveTab('list')}
             >
-              All Cases ({cases.length})
+              <FileText size={18} />
+              All Cases
             </button>
           </div>
 
@@ -587,8 +646,14 @@ const KYCOnboardingApp = () => {
                           <span>
                             {documents[docType] ? documents[docType].name : `Upload ${docType.toUpperCase()}`}
                           </span>
+                          {uploadProgress[docType] === 'uploading' && (
+                            <div className="upload-uploading">⏳ Uploading...</div>
+                          )}
                           {uploadProgress[docType] === 'success' && (
-                            <div className="upload-success">✓ Processed</div>
+                            <div className="upload-success">✓ Ready</div>
+                          )}
+                          {uploadProgress[docType] === 'error' && (
+                            <div className="upload-error">✗ Error</div>
                           )}
                         </label>
                       </div>
@@ -602,7 +667,7 @@ const KYCOnboardingApp = () => {
                   className="btn btn-primary"
                   style={{marginTop: '1.5rem'}}
                 >
-                  Create Case with OCR
+                  {loading ? 'Creating Case...' : 'Create Case with OCR'}
                 </button>
               </div>
             )}

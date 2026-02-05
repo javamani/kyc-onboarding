@@ -1,391 +1,471 @@
+# ocr_processor_fixed.py - Fixed version with PaddleOCR integration
 import io
+import os
 from PIL import Image
-import pytesseract
-from typing import Dict, Optional, Union
 import cv2
 import numpy as np
+from typing import Dict, Optional, Union, List
+import re
+from pdf2image import convert_from_bytes
 
-class OCRProcessor:
+class PaddleOCRProcessor:
     """
-    OCR processor with proper BytesIO handling for the RAG Compliance Engine
-    Fixes the "cannot identify image file" error
-    """
-    
-    def __init__(self, tesseract_cmd: Optional[str] = None):
-        """
-        Initialize OCR processor
-        
-        Args:
-            tesseract_cmd: Path to tesseract executable (if not in PATH)
-        """
-        if tesseract_cmd:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-    
-    def process_image_for_ocr(self, image_source: Union[bytes, str, Image.Image]) -> Dict:
-        """
-        Process image for OCR with proper error handling
-        
-        Args:
-            image_source: Can be bytes, file path, or PIL Image
-            
-        Returns:
-            Dictionary with OCR results and processing info
-        """
-        try:
-            # Convert to PIL Image based on input type
-            img = self._load_image(image_source)
-            
-            if img is None:
-                return {
-                    'success': False,
-                    'error': 'Failed to load image',
-                    'text': None
-                }
-            
-            # Preprocess image for better OCR
-            processed_img = self._preprocess_image(img)
-            
-            # Perform OCR
-            text = pytesseract.image_to_string(processed_img)
-            
-            # Get additional OCR data (confidence, bounding boxes, etc.)
-            ocr_data = pytesseract.image_to_data(processed_img, output_type=pytesseract.Output.DICT)
-            
-            # Calculate average confidence
-            confidences = [int(conf) for conf in ocr_data['conf'] if conf != '-1']
-            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
-            
-            return {
-                'success': True,
-                'text': text.strip(),
-                'confidence': avg_confidence,
-                'word_count': len(text.split()),
-                'ocr_data': ocr_data,
-                'image_size': img.size
-            }
-            
-        except Exception as e:
-            return {
-                'success': False,
-                'error': f'OCR processing failed: {str(e)}',
-                'text': None
-            }
-    
-    def _load_image(self, image_source: Union[bytes, str, Image.Image]) -> Optional[Image.Image]:
-        """
-        Load image from various sources with proper BytesIO handling
-        
-        Args:
-            image_source: bytes, file path, or PIL Image
-            
-        Returns:
-            PIL Image object or None
-        """
-        try:
-            if isinstance(image_source, Image.Image):
-                # Already a PIL Image
-                return image_source.copy()
-            
-            elif isinstance(image_source, bytes):
-                # CRITICAL FIX: Proper BytesIO handling
-                img_io = io.BytesIO(image_source)
-                img_io.seek(0)  # Ensure we're at the start
-                
-                # Open and load the image
-                img = Image.open(img_io)
-                img.load()  # Force loading of image data
-                
-                # Create a copy to avoid BytesIO closure issues
-                img_copy = img.copy()
-                
-                # Close the BytesIO object
-                img_io.close()
-                
-                return img_copy
-            
-            elif isinstance(image_source, str):
-                # File path
-                img = Image.open(image_source)
-                img.load()
-                return img
-            
-            else:
-                print(f"Unsupported image source type: {type(image_source)}")
-                return None
-                
-        except Exception as e:
-            print(f"Error loading image: {str(e)}")
-            return None
-    
-    def _preprocess_image(self, img: Image.Image) -> Image.Image:
-        """
-        Preprocess image to improve OCR accuracy
-        
-        Args:
-            img: PIL Image object
-            
-        Returns:
-            Preprocessed PIL Image
-        """
-        try:
-            # Convert to numpy array for OpenCV processing
-            img_array = np.array(img)
-            
-            # Convert to grayscale if not already
-            if len(img_array.shape) == 3:
-                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-            else:
-                gray = img_array
-            
-            # Apply denoising
-            denoised = cv2.fastNlMeansDenoising(gray)
-            
-            # Apply adaptive thresholding
-            thresh = cv2.adaptiveThreshold(
-                denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                cv2.THRESH_BINARY, 11, 2
-            )
-            
-            # Convert back to PIL Image
-            processed_img = Image.fromarray(thresh)
-            
-            return processed_img
-            
-        except Exception as e:
-            print(f"Preprocessing failed, using original image: {str(e)}")
-            return img
-    
-    def quality_check_before_ocr(self, image_source: Union[bytes, str, Image.Image]) -> Dict:
-        """
-        Perform quality check before OCR processing
-        
-        Args:
-            image_source: Image to check
-            
-        Returns:
-            Quality check results
-        """
-        try:
-            img = self._load_image(image_source)
-            
-            if img is None:
-                return {
-                    'passed': False,
-                    'reason': 'Failed to load image',
-                    'details': {}
-                }
-            
-            width, height = img.size
-            
-            # Check minimum dimensions
-            if width < 100 or height < 100:
-                return {
-                    'passed': False,
-                    'reason': f'Image too small: {width}x{height}',
-                    'details': {'size': (width, height)}
-                }
-            
-            # Check if image is blank/empty
-            img_array = np.array(img.convert('L'))
-            std_dev = np.std(img_array)
-            
-            if std_dev < 10:
-                return {
-                    'passed': False,
-                    'reason': 'Image appears to be blank or has very low contrast',
-                    'details': {'std_dev': float(std_dev)}
-                }
-            
-            # Check brightness
-            mean_brightness = np.mean(img_array)
-            
-            if mean_brightness < 20 or mean_brightness > 250:
-                return {
-                    'passed': False,
-                    'reason': f'Image brightness out of range: {mean_brightness:.2f}',
-                    'details': {'brightness': float(mean_brightness)}
-                }
-            
-            return {
-                'passed': True,
-                'reason': 'Image quality acceptable',
-                'details': {
-                    'size': (width, height),
-                    'brightness': float(mean_brightness),
-                    'contrast': float(std_dev)
-                }
-            }
-            
-        except Exception as e:
-            return {
-                'passed': False,
-                'reason': f'Quality check failed: {str(e)}',
-                'details': {}
-            }
-
-
-class DocumentQualityValidator:
-    """
-    Validates document quality before processing
-    This is the component that was causing your original error
+    Wrapper around PaddleOCR with proper image handling and quality validation
+    Fixes both the 'validate_document_quality' error and PDF processing issues
     """
     
-    @staticmethod
-    def validate_image_document(file_data: bytes, filename: str) -> Dict:
+    def __init__(self, use_gpu: bool = False, lang: str = 'en'):
         """
-        FIXED VERSION: Validate image document with proper BytesIO handling
+        Initialize PaddleOCR processor
         
         Args:
-            file_data: Raw image bytes
-            filename: Original filename
+            use_gpu: Whether to use GPU
+            lang: Language for OCR
+        """
+        from paddleocr import PaddleOCR
+        
+        self.ocr = PaddleOCR(use_angle_cls=True, lang=lang, use_gpu=use_gpu)
+        self.lang = lang
+    
+    def validate_document_quality(self, file_content: bytes) -> Dict:
+        """
+        FIXED: Validate document quality before OCR processing
+        This method was missing in PaddleOCR, causing the AttributeError
+        
+        Args:
+            file_content: Raw file bytes
             
         Returns:
             Validation result dictionary
         """
         try:
-            # CRITICAL FIX: Create BytesIO and seek to start
-            img_io = io.BytesIO(file_data)
-            img_io.seek(0)  # This is the key fix!
+            # Try to load as image first
+            img = self._load_image_from_bytes(file_content)
             
-            # Try to open the image
-            img = Image.open(img_io)
+            if img is None:
+                return {
+                    'valid': False,
+                    'reason': 'Cannot read image: Invalid image format or corrupted file',
+                    'details': {}
+                }
             
-            # Verify it's a valid image
-            img.verify()
+            # Check image dimensions
+            height, width = img.shape[:2]
             
-            # Close and reopen for actual processing (verify() closes the file)
-            img_io.close()
-            
-            # Reopen for processing
-            img_io = io.BytesIO(file_data)
-            img_io.seek(0)
-            img = Image.open(img_io)
-            img.load()  # Load image data into memory
-            
-            # Perform quality checks
-            width, height = img.size
-            
-            quality_result = {
-                'success': True,
-                'format': img.format,
-                'mode': img.mode,
-                'size': (width, height),
-                'filename': filename
-            }
-            
-            # Check dimensions
             if width < 100 or height < 100:
-                quality_result['success'] = False
-                quality_result['error'] = f'Image too small: {width}x{height}'
+                return {
+                    'valid': False,
+                    'reason': f'Image too small: {width}x{height} pixels (minimum 100x100)',
+                    'details': {'size': (width, height)}
+                }
             
-            # Check file size (in bytes)
-            file_size = len(file_data)
-            if file_size > 50 * 1024 * 1024:  # 50MB
-                quality_result['success'] = False
-                quality_result['error'] = f'File too large: {file_size / (1024*1024):.2f}MB'
+            # Check if image is too large
+            if width > 10000 or height > 10000:
+                return {
+                    'valid': False,
+                    'reason': f'Image too large: {width}x{height} pixels (maximum 10000x10000)',
+                    'details': {'size': (width, height)}
+                }
             
-            img_io.close()
+            # Check image content (not blank)
+            if len(img.shape) == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img
             
-            return quality_result
+            std_dev = np.std(gray)
+            mean_brightness = np.mean(gray)
+            
+            if std_dev < 5:
+                return {
+                    'valid': False,
+                    'reason': 'Image appears to be blank or has very low contrast',
+                    'details': {'std_dev': float(std_dev), 'brightness': float(mean_brightness)}
+                }
+            
+            if mean_brightness < 10 or mean_brightness > 250:
+                return {
+                    'valid': False,
+                    'reason': f'Image brightness out of acceptable range: {mean_brightness:.2f}',
+                    'details': {'brightness': float(mean_brightness)}
+                }
+            
+            return {
+                'valid': True,
+                'reason': 'Document quality acceptable',
+                'details': {
+                    'size': (width, height),
+                    'brightness': float(mean_brightness),
+                    'contrast': float(std_dev),
+                    'channels': len(img.shape)
+                }
+            }
             
         except Exception as e:
             return {
-                'success': False,
-                'error': f'Document quality check failed: {str(e)}',
-                'filename': filename
+                'valid': False,
+                'reason': f'Document quality check failed: {str(e)}',
+                'details': {}
             }
-
-
-# Integration example with your existing modules
-class RAGDocumentProcessor:
-    """
-    Complete document processor for RAG-based compliance engine
-    Integrates upload, OCR, and quality checks
-    """
     
-    def __init__(self, upload_dir: str = "./compliance_docs"):
-        from document_upload_handler import DocumentUploadHandler
-        
-        self.upload_handler = DocumentUploadHandler(upload_dir=upload_dir)
-        self.ocr_processor = OCRDocumentProcessor()
-        self.validator = DocumentQualityValidator()
-    
-    def process_document(self, file_data: bytes, filename: str, 
-                        user_id: str = None, doc_type: str = None) -> Dict:
+    def _load_image_from_bytes(self, file_content: bytes) -> Optional[np.ndarray]:
         """
-        Complete document processing pipeline
+        FIXED: Load image from bytes with proper BytesIO handling
+        Supports both regular images (JPG, PNG) and PDFs
         
         Args:
-            file_data: Raw file bytes
-            filename: Original filename
-            user_id: User who uploaded
-            doc_type: Document type (regulation, policy, etc.)
+            file_content: Raw file bytes
             
         Returns:
-            Complete processing result
+            OpenCV image (numpy array) or None
         """
-        result = {
-            'success': False,
-            'stages': {}
-        }
-        
         try:
-            # Stage 1: Upload and save
-            upload_result = self.upload_handler.process_upload(
-                file_data, filename, user_id, doc_type
+            # First, try to detect if it's a PDF
+            if file_content[:4] == b'%PDF':
+                # It's a PDF - convert to images
+                images = convert_from_bytes(file_content, dpi=300, first_page=1, last_page=1)
+                if images:
+                    # Convert PIL Image to OpenCV format
+                    pil_img = images[0]
+                    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                else:
+                    return None
+            
+            # Not a PDF, try as regular image
+            # CRITICAL FIX: Proper BytesIO handling
+            img_io = io.BytesIO(file_content)
+            img_io.seek(0)  # Ensure we're at the start
+            
+            # Try opening with PIL first
+            try:
+                pil_img = Image.open(img_io)
+                pil_img.load()  # Force loading of image data
+                
+                # Convert PIL Image to OpenCV format
+                img_array = np.array(pil_img)
+                
+                # Convert RGB to BGR if needed (OpenCV uses BGR)
+                if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+                    img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                else:
+                    img_cv = img_array
+                
+                img_io.close()
+                return img_cv
+                
+            except Exception as pil_error:
+                # PIL failed, try direct OpenCV decode
+                img_io.close()
+                
+                # Use OpenCV to decode from bytes
+                nparr = np.frombuffer(file_content, np.uint8)
+                img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if img_cv is not None:
+                    return img_cv
+                else:
+                    print(f"Failed to decode image: {str(pil_error)}")
+                    return None
+                    
+        except Exception as e:
+            print(f"Error loading image from bytes: {str(e)}")
+            return None
+    
+    def _preprocess_image(self, img: np.ndarray) -> np.ndarray:
+        """
+        Preprocess image for better OCR results
+        
+        Args:
+            img: OpenCV image (numpy array)
+            
+        Returns:
+            Preprocessed image
+        """
+        try:
+            # Convert to grayscale if needed
+            if len(img.shape) == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img
+            
+            # Denoise
+            denoised = cv2.fastNlMeansDenoising(gray)
+            
+            # Adaptive thresholding
+            thresh = cv2.adaptiveThreshold(
+                denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 11, 2
             )
-            result['stages']['upload'] = upload_result
             
-            if not upload_result['success']:
-                result['error'] = upload_result['error']
-                return result
-            
-            file_type = upload_result['file_info']['file_type']
-            
-            # Stage 2: Quality check (for images)
-            if file_type == 'image':
-                quality_result = self.validator.validate_image_document(file_data, filename)
-                result['stages']['quality_check'] = quality_result
-                
-                if not quality_result['success']:
-                    result['error'] = quality_result['error']
-                    return result
-                
-                # Stage 3: OCR processing
-                ocr_result = self.ocr_processor.process_image_for_ocr(file_data)
-                result['stages']['ocr'] = ocr_result
-                
-                if not ocr_result['success']:
-                    result['error'] = ocr_result['error']
-                    return result
-                
-                result['extracted_text'] = ocr_result['text']
-                result['ocr_confidence'] = ocr_result['confidence']
-            
-            # Add more processing stages for other file types (PDF, DOCX, etc.)
-            
-            result['success'] = True
-            result['file_path'] = upload_result['file_info']['file_path']
-            
-            return result
+            return thresh
             
         except Exception as e:
-            result['error'] = f'Document processing failed: {str(e)}'
-            return result
-
-
-# Test the fixed implementation
-if __name__ == "__main__":
-    print("Testing Fixed OCR Document Processor")
-    print("=" * 50)
+            print(f"Preprocessing failed, using original: {str(e)}")
+            return img
     
-    # Create a simple test image
+    def extract_text_generic(self, file_content: bytes) -> Dict:
+        """
+        Extract text from document using PaddleOCR
+        
+        Args:
+            file_content: Raw file bytes
+            
+        Returns:
+            OCR result dictionary
+        """
+        try:
+            # Load image
+            img = self._load_image_from_bytes(file_content)
+            
+            if img is None:
+                return {
+                    'status': 'error',
+                    'error': 'Failed to load image',
+                    'raw_text': '',
+                    'confidence_score': 0.0
+                }
+            
+            # Run PaddleOCR
+            result = self.ocr.ocr(img, cls=True)
+            
+            if not result or not result[0]:
+                return {
+                    'status': 'error',
+                    'error': 'No text detected in image',
+                    'raw_text': '',
+                    'confidence_score': 0.0
+                }
+            
+            # Extract text and confidence
+            text_lines = []
+            confidences = []
+            
+            for line in result[0]:
+                if line and len(line) >= 2:
+                    text = line[1][0]  # Text content
+                    confidence = line[1][1]  # Confidence score
+                    
+                    text_lines.append(text)
+                    confidences.append(confidence)
+            
+            raw_text = '\n'.join(text_lines)
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+            
+            return {
+                'status': 'success',
+                'raw_text': raw_text,
+                'confidence_score': avg_confidence,
+                'text_lines': text_lines,
+                'line_confidences': confidences
+            }
+            
+        except Exception as e:
+            return {
+                'status': 'error',
+                'error': f'OCR processing failed: {str(e)}',
+                'raw_text': '',
+                'confidence_score': 0.0
+            }
+    
+    def extract_pan_specific(self, file_content: bytes) -> Dict:
+        """
+        Extract PAN-specific information
+        
+        Args:
+            file_content: Raw file bytes
+            
+        Returns:
+            Extracted PAN data
+        """
+        result = self.extract_text_generic(file_content)
+        
+        if result['status'] == 'error':
+            return result
+        
+        text = result['raw_text']
+        
+        # Extract PAN number
+        pan_pattern = r'\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b'
+        pan_match = re.search(pan_pattern, text)
+        
+        # Extract name
+        name = self._extract_name_from_text(text)
+        
+        # Extract date of birth
+        dob = self._extract_dob_from_text(text)
+        
+        result['document_type'] = 'pan'
+        result['extracted_fields'] = {
+            'pan_number': pan_match.group(0) if pan_match else None,
+            'name': name,
+            'dob': dob
+        }
+        
+        return result
+    
+    def extract_aadhaar_specific(self, file_content: bytes) -> Dict:
+        """
+        Extract Aadhaar-specific information
+        
+        Args:
+            file_content: Raw file bytes
+            
+        Returns:
+            Extracted Aadhaar data
+        """
+        result = self.extract_text_generic(file_content)
+        
+        if result['status'] == 'error':
+            return result
+        
+        text = result['raw_text']
+        
+        # Extract Aadhaar number (with or without spaces)
+        aadhaar_pattern = r'\b\d{4}\s?\d{4}\s?\d{4}\b'
+        aadhaar_match = re.search(aadhaar_pattern, text)
+        
+        # Extract name
+        name = self._extract_name_from_text(text)
+        
+        # Extract date of birth
+        dob = self._extract_dob_from_text(text)
+        
+        # Extract address
+        address = self._extract_address_from_text(text)
+        
+        result['document_type'] = 'aadhaar'
+        result['extracted_fields'] = {
+            'aadhaar_number': aadhaar_match.group(0) if aadhaar_match else None,
+            'name': name,
+            'dob': dob,
+            'address': address
+        }
+        
+        return result
+    
+    def extract_passport_specific(self, file_content: bytes) -> Dict:
+        """
+        Extract Passport-specific information
+        
+        Args:
+            file_content: Raw file bytes
+            
+        Returns:
+            Extracted Passport data
+        """
+        result = self.extract_text_generic(file_content)
+        
+        if result['status'] == 'error':
+            return result
+        
+        text = result['raw_text']
+        
+        # Extract passport number
+        passport_pattern = r'\b[A-Z]{1}\d{7}\b'
+        passport_match = re.search(passport_pattern, text)
+        
+        # Extract name
+        name = self._extract_name_from_text(text)
+        
+        # Extract date of birth
+        dob = self._extract_dob_from_text(text)
+        
+        # Extract address
+        address = self._extract_address_from_text(text)
+        
+        result['document_type'] = 'passport'
+        result['extracted_fields'] = {
+            'passport_number': passport_match.group(0) if passport_match else None,
+            'name': name,
+            'dob': dob,
+            'address': address
+        }
+        
+        return result
+    
+    def _extract_name_from_text(self, text: str) -> Optional[str]:
+        """Extract name from OCR text"""
+        # Look for name patterns
+        name_patterns = [
+            r'(?i)name[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})',
+            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b'
+        ]
+        
+        for pattern in name_patterns:
+            match = re.search(pattern, text)
+            if match:
+                name = match.group(1)
+                # Filter out common non-name words
+                if not any(word in name for word in ['Income', 'Tax', 'Government', 'India', 'Permanent']):
+                    return name
+        
+        return None
+    
+    def _extract_dob_from_text(self, text: str) -> Optional[str]:
+        """Extract date of birth from text"""
+        date_patterns = [
+            r'\b(\d{2}[-/]\d{2}[-/]\d{4})\b',
+            r'\b(\d{4}[-/]\d{2}[-/]\d{2})\b',
+            r'\b(\d{2}\s+[A-Za-z]+\s+\d{4})\b'
+        ]
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1)
+        
+        return None
+    
+    def _extract_address_from_text(self, text: str) -> Optional[str]:
+        """Extract address from text"""
+        # Look for address keywords and extract surrounding context
+        lines = text.split('\n')
+        address_keywords = ['address', 'residence', 'house', 'flat', 'street', 'pin']
+        
+        for i, line in enumerate(lines):
+            if any(keyword in line.lower() for keyword in address_keywords):
+                # Get this line and next 2-3 lines
+                end_idx = min(i + 3, len(lines))
+                address_lines = lines[i:end_idx]
+                return ' '.join([l.strip() for l in address_lines if l.strip()])
+        
+        return None
+
+
+# For backward compatibility with existing code
+OCRProcessor = PaddleOCRProcessor
+
+
+if __name__ == "__main__":
+    print("Testing Fixed PaddleOCR Processor")
+    print("=" * 60)
+    
+    # Initialize processor
+    processor = PaddleOCRProcessor(use_gpu=False, lang='en')
+    
+    # Create a test image
     from PIL import Image, ImageDraw, ImageFont
     
-    # Create test image with text
-    img = Image.new('RGB', (400, 200), color='white')
+    img = Image.new('RGB', (600, 400), color='white')
     draw = ImageDraw.Draw(img)
-    draw.text((20, 80), "Sample Compliance Document", fill='black')
+    
+    # Draw sample PAN card text
+    text_content = [
+        "INCOME TAX DEPARTMENT",
+        "GOVT. OF INDIA",
+        "",
+        "Permanent Account Number",
+        "ABCDE1234F",
+        "",
+        "Name: JOHN DOE",
+        "Father's Name: ROBERT DOE",
+        "Date of Birth: 15/06/1990"
+    ]
+    
+    y = 20
+    for line in text_content:
+        draw.text((20, y), line, fill='black')
+        y += 30
     
     # Convert to bytes
     img_io = io.BytesIO()
@@ -394,21 +474,21 @@ if __name__ == "__main__":
     img_io.close()
     
     # Test quality validation
-    validator = DocumentQualityValidator()
-    validation_result = validator.validate_image_document(img_bytes, "test.png")
+    print("\n1. Testing quality validation...")
+    quality = processor.validate_document_quality(img_bytes)
+    print(f"   Valid: {quality['valid']}")
+    print(f"   Reason: {quality['reason']}")
+    print(f"   Details: {quality.get('details', {})}")
     
-    print(f"\nValidation Result: {validation_result}")
+    # Test OCR extraction
+    if quality['valid']:
+        print("\n2. Testing PAN extraction...")
+        result = processor.extract_pan_specific(img_bytes)
+        print(f"   Status: {result['status']}")
+        if result['status'] == 'success':
+            print(f"   Confidence: {result['confidence_score']:.2%}")
+            print(f"   Extracted Fields: {result.get('extracted_fields', {})}")
+            print(f"   Raw Text Preview: {result['raw_text'][:100]}...")
     
-    # Test OCR
-    ocr_processor = OCRDocumentProcessor()
-    quality_check = ocr_processor.quality_check_before_ocr(img_bytes)
-    
-    print(f"\nQuality Check: {quality_check}")
-    
-    if quality_check['passed']:
-        ocr_result = ocr_processor.process_image_for_ocr(img_bytes)
-        print(f"\nOCR Result:")
-        print(f"Success: {ocr_result['success']}")
-        if ocr_result['success']:
-            print(f"Extracted Text: {ocr_result['text']}")
-            print(f"Confidence: {ocr_result['confidence']:.2f}%")
+    print("\n" + "=" * 60)
+    print("Testing complete!")
