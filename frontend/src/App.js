@@ -330,11 +330,12 @@ const KYCOnboardingApp = () => {
       setLoading(true);
       const response = await fetch(`${API_BASE}/cases/${caseId}/submit`, {
         method: 'POST',
-        headers: getAuthHeaders()
+        headers: getAuthHeaders(),
+        body: JSON.stringify({})
       });
 
       if (response.ok) {
-        alert('Case submitted successfully!');
+        alert('✅ Case submitted successfully for review!');
         fetchCases();
       } else {
         const error = await response.json();
@@ -378,6 +379,39 @@ const KYCOnboardingApp = () => {
     }
   };
 
+  const returnToMaker = async (caseId) => {
+    const comments = prompt('Enter reason for returning to maker (required - explain what needs to be fixed):');
+    
+    if (!comments || comments.trim() === '') {
+      alert('Please provide a reason for returning the case to the maker.');
+      return;
+    }
+    
+    try {
+      setLoading(true);
+      const response = await fetch(`${API_BASE}/cases/${caseId}/return-to-maker`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({
+          comments: comments
+        })
+      });
+
+      if (response.ok) {
+        alert('✅ Case returned to maker for corrections.\n\nThe maker will be able to reupload documents and resubmit.');
+        fetchCases();
+      } else {
+        const error = await response.json();
+        alert(`Error: ${error.detail}`);
+      }
+    } catch (error) {
+      console.error('Error returning case:', error);
+      alert('Failed to return case to maker');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const getConfidenceColor = (score) => {
     if (score >= 0.9) return 'confidence-high';
     if (score >= 0.7) return 'confidence-medium';
@@ -396,33 +430,66 @@ const KYCOnboardingApp = () => {
 
   const renderOCRResults = (ocrResults) => {
     return (
-      <div className="ocr-results">
+      <div className="ocr-results-container">
         {Object.entries(ocrResults).map(([docType, data]) => (
-          <div key={docType} className="ocr-section">
-            <h5>{docType.toUpperCase()}</h5>
-            <div className="ocr-data">
-              {Object.entries(data.extracted_data || {}).map(([key, value]) => (
-                <div key={key} className="ocr-field">
-                  <span className="ocr-label">{key}:</span>
-                  <span className="ocr-value">{value}</span>
-                </div>
-              ))}
-              <div className="ocr-confidence">
-                <span className={getConfidenceColor(data.confidence)}>
-                  Confidence: {
-      !isNaN(Number(data.confidence))
-        ? (Number(data.confidence) * 100).toFixed(1) + '%'
-        : 'N/A'
-    }
-                </span>
+          <div key={docType} className="ocr-result-card">
+            <div className="ocr-header">
+              <div className="doc-type">{docType.toUpperCase()} Document</div>
+              <div className={`confidence-badge confidence-${data.confidence_score > 0.8 ? 'high' : data.confidence_score > 0.6 ? 'medium' : 'low'}`}>
+                <FileCheck size={14} />
+                {(data.confidence_score * 100).toFixed(1)}% Confidence
               </div>
-              {data.anomalies && data.anomalies.length > 0 && (
-                <div className="anomalies">
-                  <AlertTriangle size={16} />
-                  <span>Anomalies: {data.anomalies.join(', ')}</span>
-                </div>
-              )}
             </div>
+
+            {/* Extracted Fields */}
+            {data.extracted_fields && Object.keys(data.extracted_fields).length > 0 && (
+              <div className="extracted-fields">
+                <div className="section-title">EXTRACTED DATA</div>
+                <div className="fields-grid">
+                  {Object.entries(data.extracted_fields).map(([key, value]) => (
+                    <div key={key} className="field-item">
+                      <span className="field-label">{key.replace(/_/g, ' ')}:</span>
+                      <span className="field-value">{value || 'N/A'}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Validation Results */}
+            {data.validation && (
+              <div className="validation-section">
+                <div className="section-title">VALIDATION RESULTS</div>
+                <div className="match-score">
+                  Overall Match: 
+                  <span className={getConfidenceColor(data.validation.overall_match_score)}>
+                    {' '}{(data.validation.overall_match_score * 100).toFixed(1)}%
+                  </span>
+                </div>
+                
+                {data.validation.matches && Object.keys(data.validation.matches).length > 0 && (
+                  <div className="validation-matches">
+                    ✓ Matched Fields: {Object.keys(data.validation.matches).join(', ')}
+                  </div>
+                )}
+                
+                {data.validation.mismatches && Object.keys(data.validation.mismatches).length > 0 && (
+                  <div className="validation-mismatches">
+                    ✗ Mismatched Fields: {Object.keys(data.validation.mismatches).join(', ')}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Quality Check Info */}
+            {data.quality_check && data.quality_check.details && (
+              <div className="quality-info">
+                Quality: {data.quality_check.reason} 
+                {data.quality_check.details.size && 
+                  ` | Size: ${data.quality_check.details.size[0]}x${data.quality_check.details.size[1]}px`
+                }
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -691,13 +758,14 @@ const KYCOnboardingApp = () => {
                       <div className="case-info">
                         <div className="case-title-row">
                           <h3>{caseItem.customer_name}</h3>
-                          <span className={`status-badge status-${caseItem.status.toLowerCase()}`}>
+                          <span className={`status-badge status-${caseItem.status.toLowerCase().replace(/_/g, '_')}`}>
                             {caseItem.status === 'DRAFT' && <FileText size={14} />}
                             {caseItem.status === 'SUBMITTED' && <Upload size={14} />}
                             {caseItem.status === 'AI_REVIEWED' && <Clock size={14} />}
+                            {caseItem.status === 'RETURNED_TO_MAKER' && <AlertCircle size={14} />}
                             {caseItem.status === 'CHECKER_APPROVED' && <CheckCircle size={14} />}
                             {caseItem.status === 'CHECKER_REJECTED' && <XCircle size={14} />}
-                            {caseItem.status}
+                            {caseItem.status.replace(/_/g, ' ')}
                           </span>
                           {caseItem.ai_score && (
                             <span className="ai-score">
@@ -716,6 +784,12 @@ const KYCOnboardingApp = () => {
                           <p>Case ID: {caseItem.id}</p>
                           <p>Created by: {caseItem.created_by_name}</p>
                           <p>Created: {new Date(caseItem.created_at).toLocaleString()}</p>
+                          {caseItem.status === 'RETURNED_TO_MAKER' && caseItem.return_reason && (
+                            <p style={{color: '#f59e0b', fontWeight: '500', marginTop: '0.5rem'}}>
+                              <AlertTriangle size={16} style={{verticalAlign: 'middle'}} />
+                              {' '}Checker's feedback: {caseItem.return_reason}
+                            </p>
+                          )}
                           {caseItem.data_match_score > 0 && (
                             <p className={getConfidenceColor(caseItem.data_match_score)}>
                               Data Match: {(caseItem.data_match_score * 100).toFixed(1)}%
@@ -730,11 +804,21 @@ const KYCOnboardingApp = () => {
                             Submit
                           </button>
                         )}
+
+                        {/* MAKER can resubmit returned cases after fixing issues */}
+                        {currentUser?.role === 'MAKER' && caseItem.status === 'RETURNED_TO_MAKER' && caseItem.created_by === currentUser.id && (
+                          <button onClick={() => submitCase(caseItem.id)} className="btn btn-primary btn-sm">
+                            Resubmit
+                          </button>
+                        )}
                         
                         {currentUser?.role === 'CHECKER' && (caseItem.status === 'SUBMITTED' || caseItem.status === 'AI_REVIEWED') && (
                           <>
                             <button onClick={() => reviewCase(caseItem.id, 'approve')} className="btn btn-success btn-sm">
                               Approve
+                            </button>
+                            <button onClick={() => returnToMaker(caseItem.id)} className="btn" style={{backgroundColor: '#f59e0b', color: 'white'}} title="Return to Maker for corrections">
+                              Return to Maker
                             </button>
                             <button onClick={() => reviewCase(caseItem.id, 'reject')} className="btn btn-danger btn-sm">
                               Reject
@@ -754,16 +838,229 @@ const KYCOnboardingApp = () => {
                     
                     {selectedCase?.id === caseItem.id && (
                       <div className="case-details-expanded">
+                        {/* AI-Extracted Data & Risk Assessment Section - Prominent for CHECKER */}
+                        {currentUser?.role === 'CHECKER' && caseItem.validation_result && (
+                          <div className="details-section">
+                            <h4>
+                              <Shield size={18} />
+                              AI Risk Assessment & Validation
+                            </h4>
+                            
+                            <div className="validation-container">
+                              {/* Risk Overview */}
+                              <div className="risk-overview">
+                                <div className="risk-score-card">
+                                  <Shield size={40} />
+                                  <div>
+                                    <div className="risk-score-label">Risk Score</div>
+                                    <div className="risk-score">{caseItem.risk_score || 0}/100</div>
+                                    <div className="risk-level">{caseItem.risk_level || 'UNKNOWN'}</div>
+                                  </div>
+                                </div>
+                                
+                                <div className="validation-status">
+                                  <div className={caseItem.validation_result.is_valid ? 'status-valid' : 'status-invalid'}>
+                                    {caseItem.validation_result.is_valid ? (
+                                      <>
+                                        <CheckCircle size={20} />
+                                        Validation Passed
+                                      </>
+                                    ) : (
+                                      <>
+                                        <XCircle size={20} />
+                                        Validation Failed
+                                      </>
+                                    )}
+                                  </div>
+                                  {caseItem.ai_score && (
+                                    <div style={{marginTop: '0.5rem', fontSize: '0.875rem'}}>
+                                      <Award size={16} style={{verticalAlign: 'middle'}} />
+                                      <strong> AI Confidence: </strong>{caseItem.ai_score}/100
+                                    </div>
+                                  )}
+                                  {caseItem.data_match_score > 0 && (
+                                    <div style={{marginTop: '0.25rem', fontSize: '0.875rem'}}>
+                                      <strong>Data Match: </strong>
+                                      <span className={getConfidenceColor(caseItem.data_match_score)}>
+                                        {(caseItem.data_match_score * 100).toFixed(1)}%
+                                      </span>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+
+                              {/* GenAI Explanation */}
+                              {caseItem.validation_result.ai_explanation && (
+                                <div style={{
+                                  backgroundColor: '#f0f9ff',
+                                  border: '1px solid #bfdbfe',
+                                  borderRadius: '0.5rem',
+                                  padding: '1rem',
+                                  marginTop: '1rem'
+                                }}>
+                                  <h5 style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.5rem',
+                                    color: '#1e40af',
+                                    fontSize: '1rem',
+                                    fontWeight: 600,
+                                    marginBottom: '0.5rem'
+                                  }}>
+                                    <AlertCircle size={18} />
+                                    AI Analysis Explanation
+                                  </h5>
+                                  <p style={{fontSize: '0.875rem', color: '#374151', lineHeight: '1.5'}}>
+                                    {caseItem.validation_result.ai_explanation}
+                                  </p>
+                                </div>
+                              )}
+
+                              {/* Anomalies Detected */}
+                              {caseItem.validation_result.anomalies && caseItem.validation_result.anomalies.length > 0 && (
+                                <div className="anomalies-section">
+                                  <h5>
+                                    <AlertTriangle size={18} />
+                                    Anomalies Detected ({caseItem.validation_result.anomalies.length})
+                                  </h5>
+                                  <div className="anomalies-list">
+                                    {caseItem.validation_result.anomalies.map((anomaly, idx) => (
+                                      <div key={idx} className={`anomaly-item severity-${anomaly.severity || 'medium'}`}>
+                                        <div className="anomaly-header">
+                                          <span className="anomaly-type">{anomaly.type || 'Unknown'}</span>
+                                          <span className={`anomaly-severity ${anomaly.severity || 'medium'}`}>
+                                            {anomaly.severity || 'MEDIUM'}
+                                          </span>
+                                        </div>
+                                        {anomaly.field && (
+                                          <div className="anomaly-field">Field: {anomaly.field}</div>
+                                        )}
+                                        <div className="anomaly-description">
+                                          {anomaly.description || anomaly.message || 'No description available'}
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Recommendations */}
+                              {caseItem.validation_result.recommendations && caseItem.validation_result.recommendations.length > 0 && (
+                                <div className="recommendations-section">
+                                  <h5>AI Recommendations</h5>
+                                  <ul className="recommendations-list">
+                                    {caseItem.validation_result.recommendations.map((rec, idx) => (
+                                      <li key={idx}>{rec}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+
+                              {/* Validation Scores Breakdown */}
+                              {caseItem.validation_result.field_validations && (
+                                <div className="scores-breakdown">
+                                  <h5>Field Validation Scores</h5>
+                                  <div className="scores-grid">
+                                    {Object.entries(caseItem.validation_result.field_validations).map(([field, score]) => (
+                                      <div key={field} className="score-item">
+                                        <div className="score-label">{field.replace(/_/g, ' ')}</div>
+                                        <div className="score-bar">
+                                          <div 
+                                            className="score-fill" 
+                                            style={{
+                                              width: `${score * 100}%`,
+                                              backgroundColor: score > 0.8 ? '#059669' : score > 0.6 ? '#d97706' : '#dc2626'
+                                            }}
+                                          />
+                                        </div>
+                                        <div className="score-value">{(score * 100).toFixed(0)}%</div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Document Reupload Section for RETURNED_TO_MAKER cases */}
+                        {currentUser?.role === 'MAKER' && caseItem.status === 'RETURNED_TO_MAKER' && caseItem.created_by === currentUser.id && (
+                          <div className="details-section">
+                            <h4 style={{color: '#f59e0b'}}>
+                              <Upload size={18} />
+                              Reupload Documents
+                            </h4>
+                            <div style={{
+                              backgroundColor: '#fffbeb',
+                              border: '1px solid: #fcd34d',
+                              borderRadius: '0.5rem',
+                              padding: '1rem',
+                              marginBottom: '1rem'
+                            }}>
+                              <p style={{color: '#92400e', marginBottom: '0.5rem'}}>
+                                <strong>Checker's Feedback:</strong> {caseItem.return_reason}
+                              </p>
+                              <p style={{fontSize: '0.875rem', color: '#78350f'}}>
+                                Please fix the issues mentioned above and reupload the necessary documents.
+                              </p>
+                            </div>
+                            
+                            <div className="documents-grid">
+                              {['pan', 'aadhaar', 'passport'].map(docType => (
+                                <div key={docType} className="document-upload">
+                                  <label className="upload-label">{docType.toUpperCase()}</label>
+                                  <div className="upload-area">
+                                    <input
+                                      type="file"
+                                      onChange={(e) => handleFileUpload(docType, e, caseItem.id)}
+                                      id={`reupload-${docType}-${caseItem.id}`}
+                                      accept=".pdf,.jpg,.jpeg,.png"
+                                      style={{display: 'none'}}
+                                    />
+                                    <label htmlFor={`reupload-${docType}-${caseItem.id}`} className="upload-button">
+                                      <Upload size={32} />
+                                      <span>
+                                        {caseItem.documents && caseItem.documents[docType] 
+                                          ? `Current: ${caseItem.documents[docType]}` 
+                                          : `Upload ${docType.toUpperCase()}`}
+                                      </span>
+                                      {uploadProgress[docType] === 'uploading' && (
+                                        <div style={{marginTop: '0.5rem', fontSize: '0.75rem', color: '#d97706'}}>
+                                          ⏳ Uploading...
+                                        </div>
+                                      )}
+                                      {uploadProgress[docType] === 'success' && (
+                                        <div className="upload-success">✓ Reuploaded</div>
+                                      )}
+                                      {uploadProgress[docType] === 'error' && (
+                                        <div style={{marginTop: '0.5rem', fontSize: '0.75rem', color: '#dc2626'}}>
+                                          ✗ Error
+                                        </div>
+                                      )}
+                                    </label>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                            
+                            <p style={{fontSize: '0.875rem', color: '#6b7280', marginTop: '1rem'}}>
+                              After reuploading the necessary documents, click "Resubmit" above to send the case back to the checker.
+                            </p>
+                          </div>
+                        )}
+
+                        {/* OCR Extracted Data Section */}
                         {caseItem.ocr_results && Object.keys(caseItem.ocr_results).length > 0 && (
                           <div className="details-section">
                             <h4>
                               <FileCheck size={18} />
-                              OCR Results
+                              AI-Extracted Data from Documents
                             </h4>
                             {renderOCRResults(caseItem.ocr_results)}
                           </div>
                         )}
 
+                        {/* Audit Trail */}
                         <div className="details-section">
                           <h4>Audit Trail</h4>
                           <div className="audit-trail">
