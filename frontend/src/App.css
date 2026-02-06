@@ -1002,4 +1002,24 @@
   .audit-time {
     min-width: auto;
   }
+
+
+/* Additional CSS for RETURNED_TO_MAKER status */
+/* Add this to your existing App.css file */
+
+.status-returned_to_maker {
+  background-color: #fef3c7;
+  color: #92400e;
+}
+
+/* Optional: Add hover effect for Return to Maker button */
+.btn-return-to-maker {
+  background-color: #f59e0b;
+  color: white;
+}
+
+.btn-return-to-maker:hover:not(:disabled) {
+  background-color: #d97706;
+}
+
 }

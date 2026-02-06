@@ -81,6 +81,7 @@ class CaseStatus(str, Enum):
     DRAFT = "DRAFT"
     SUBMITTED = "SUBMITTED"
     AI_REVIEWED = "AI_REVIEWED"
+    RETURNED_TO_MAKER = "RETURNED_TO_MAKER"
     CHECKER_APPROVED = "CHECKER_APPROVED"
     CHECKER_REJECTED = "CHECKER_REJECTED"
 
@@ -88,11 +89,13 @@ class AuditAction(str, Enum):
     CREATED = "CREATED"
     SUBMITTED = "SUBMITTED"
     AI_REVIEWED = "AI_REVIEWED"
+    RETURNED_TO_MAKER = "RETURNED_TO_MAKER"
     CHECKER_APPROVED = "CHECKER_APPROVED"
     CHECKER_REJECTED = "CHECKER_REJECTED"
     UPDATED = "UPDATED"
     DOCUMENT_UPLOADED = "DOCUMENT_UPLOADED"
     OCR_PROCESSED = "OCR_PROCESSED"
+    DOCUMENT_REUPLOADED = "DOCUMENT_REUPLOADED"
 
 # Pydantic Models
 class CaseCreateRequest(BaseModel):
@@ -122,6 +125,7 @@ def case_helper(case) -> dict:
         "updated_at": case["updated_at"].isoformat(),
         "reviewed_by": case.get("reviewed_by"),
         "reviewed_by_name": case.get("reviewed_by_name"),
+        "return_reason": case.get("return_reason"),
         "documents": case.get("documents", {}),
         "ocr_results": case.get("ocr_results", {}),
         "validation_result": case.get("validation_result", {}),
@@ -142,7 +146,7 @@ def case_helper(case) -> dict:
     }
 
 async def run_ai_review(case_id: str):
-    """Enhanced AI review with OCR validation and data matching"""
+    """Enhanced AI review with OCR validation, data matching, and GenAI explanations"""
     import random
     
     case = await db.kyc_cases.find_one({"_id": ObjectId(case_id)})
@@ -150,14 +154,17 @@ async def run_ai_review(case_id: str):
         return
     
     ocr_results = case.get("ocr_results", {})
+    validation_result = case.get("validation_result", {})
     base_score = random.randint(70, 85)
     
+    # Calculate data match score adjustment
     data_match_score = case.get("data_match_score", 0)
     if data_match_score > 0.8:
         base_score += 10
     elif data_match_score > 0.6:
         base_score += 5
     
+    # Calculate OCR confidence adjustment
     ocr_confidence = 0
     ocr_count = 0
     for doc_type, ocr_data in ocr_results.items():
@@ -172,12 +179,75 @@ async def run_ai_review(case_id: str):
     
     ai_score = min(base_score, 100)
     
+    # Generate AI explanation based on validation results
+    risk_score = validation_result.get('risk_score', 0)
+    risk_level = validation_result.get('risk_level', 'UNKNOWN')
+    anomalies = validation_result.get('anomalies', [])
+    
+    explanation_parts = []
+    
+    # Overall assessment
+    if ai_score >= 85:
+        explanation_parts.append(f"This case has achieved a high confidence score of {ai_score}/100, indicating strong verification across multiple factors.")
+    elif ai_score >= 70:
+        explanation_parts.append(f"This case has achieved a moderate confidence score of {ai_score}/100, with generally acceptable verification results.")
+    else:
+        explanation_parts.append(f"This case has a low confidence score of {ai_score}/100, requiring careful review.")
+    
+    # Data matching
+    if data_match_score > 0.8:
+        explanation_parts.append(f"The OCR-extracted data shows excellent alignment ({(data_match_score * 100):.1f}% match) with the submitted form information.")
+    elif data_match_score > 0.6:
+        explanation_parts.append(f"The OCR-extracted data shows moderate alignment ({(data_match_score * 100):.1f}% match) with the submitted form information, with minor discrepancies noted.")
+    else:
+        explanation_parts.append(f"The OCR-extracted data shows poor alignment ({(data_match_score * 100):.1f}% match) with the submitted form information, requiring manual verification.")
+    
+    # OCR quality
+    if ocr_count > 0:
+        if avg_ocr_confidence > 0.8:
+            explanation_parts.append(f"Document OCR processing achieved high confidence ({(avg_ocr_confidence * 100):.1f}%), with clear and readable document quality.")
+        elif avg_ocr_confidence > 0.6:
+            explanation_parts.append(f"Document OCR processing achieved moderate confidence ({(avg_ocr_confidence * 100):.1f}%), though some text may be unclear.")
+        else:
+            explanation_parts.append(f"Document OCR processing achieved low confidence ({(avg_ocr_confidence * 100):.1f}%), suggesting poor document quality or readability issues.")
+    
+    # Risk assessment
+    if risk_level == 'LOW':
+        explanation_parts.append(f"The risk assessment indicates LOW risk (score: {risk_score}/100), with minimal concerns identified.")
+    elif risk_level == 'MEDIUM':
+        explanation_parts.append(f"The risk assessment indicates MEDIUM risk (score: {risk_score}/100), requiring standard review procedures.")
+    elif risk_level == 'HIGH':
+        explanation_parts.append(f"The risk assessment indicates HIGH risk (score: {risk_score}/100), warranting additional scrutiny.")
+    elif risk_level == 'CRITICAL':
+        explanation_parts.append(f"The risk assessment indicates CRITICAL risk (score: {risk_score}/100), requiring immediate attention and thorough investigation.")
+    
+    # Anomalies
+    if len(anomalies) > 0:
+        explanation_parts.append(f"The system detected {len(anomalies)} anomal{'y' if len(anomalies) == 1 else 'ies'} that should be reviewed by the checker.")
+    else:
+        explanation_parts.append("No significant anomalies were detected during automated processing.")
+    
+    # Recommendation
+    if ai_score >= 85 and len(anomalies) == 0 and risk_level in ['LOW', 'MEDIUM']:
+        explanation_parts.append("RECOMMENDATION: This case appears suitable for approval, pending final checker verification.")
+    elif len(anomalies) > 2 or risk_level in ['HIGH', 'CRITICAL']:
+        explanation_parts.append("RECOMMENDATION: This case requires detailed manual review before approval.")
+    else:
+        explanation_parts.append("RECOMMENDATION: Standard checker review is recommended to verify all details.")
+    
+    ai_explanation = " ".join(explanation_parts)
+    
+    # Update validation result with AI explanation
+    updated_validation = validation_result.copy() if validation_result else {}
+    updated_validation['ai_explanation'] = ai_explanation
+    
     await db.kyc_cases.update_one(
         {"_id": ObjectId(case_id)},
         {
             "$set": {
                 "status": CaseStatus.AI_REVIEWED,
                 "ai_score": ai_score,
+                "validation_result": updated_validation,
                 "updated_at": datetime.utcnow()
             },
             "$push": {
@@ -186,7 +256,7 @@ async def run_ai_review(case_id: str):
                     "action": AuditAction.AI_REVIEWED,
                     "by": "AI System",
                     "role": "SYSTEM",
-                    "comments": f"AI verification score: {ai_score}/100"
+                    "comments": f"AI verification score: {ai_score}/100 | {ai_explanation[:100]}..."
                 }
             }
         }
@@ -462,6 +532,11 @@ async def upload_document(
             "updated_at": datetime.utcnow()
         }
         
+        # Determine if this is a reupload (case was returned to maker)
+        is_reupload = case["status"] == CaseStatus.RETURNED_TO_MAKER
+        audit_action = AuditAction.DOCUMENT_REUPLOADED if is_reupload else AuditAction.OCR_PROCESSED
+        action_label = "reuploaded" if is_reupload else "processed"
+        
         await db.kyc_cases.update_one(
             {"_id": ObjectId(case_id)},
             {
@@ -469,10 +544,10 @@ async def upload_document(
                 "$push": {
                     "audit_trail": {
                         "timestamp": datetime.utcnow(),
-                        "action": AuditAction.OCR_PROCESSED,
+                        "action": audit_action,
                         "by": current_user["full_name"],
                         "role": current_user["role"],
-                        "comments": f"{doc_type.upper()} processed - Confidence: {combined_result.get('confidence_score', 0):.2%}, Risk: {risk_assessment['risk_level']}"
+                        "comments": f"{doc_type.upper()} {action_label} - Confidence: {combined_result.get('confidence_score', 0):.2%}, Risk: {risk_assessment['risk_level']}"
                     }
                 }
             }
@@ -502,7 +577,7 @@ async def upload_document(
 @app.post("/api/cases/{case_id}/submit")
 async def submit_case(
     case_id: str,
-    request: CaseActionRequest = CaseActionRequest(),
+    request: CaseActionRequest = None,
     current_user: dict = Depends(get_current_user_with_db)
 ):
     """Submit a case for review (MAKER only)"""
@@ -520,8 +595,13 @@ async def submit_case(
     if case["created_by"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Can only submit your own cases")
     
-    if case["status"] != CaseStatus.DRAFT:
-        raise HTTPException(status_code=400, detail="Can only submit DRAFT cases")
+    # Allow submission from DRAFT or RETURNED_TO_MAKER status
+    if case["status"] not in [CaseStatus.DRAFT, CaseStatus.RETURNED_TO_MAKER]:
+        raise HTTPException(status_code=400, detail=f"Cannot submit case in {case['status']} status")
+    
+    # Determine if this is a resubmission
+    is_resubmission = case["status"] == CaseStatus.RETURNED_TO_MAKER
+    action_comment = "Case resubmitted after corrections" if is_resubmission else "Case submitted for review"
     
     await db.kyc_cases.update_one(
         {"_id": ObjectId(case_id)},
@@ -536,7 +616,7 @@ async def submit_case(
                     "action": AuditAction.SUBMITTED,
                     "by": current_user["full_name"],
                     "role": current_user["role"],
-                    "comments": request.comments or "Case submitted for review"
+                    "comments": (request.comments if request else None) or action_comment
                 }
             }
         }
@@ -647,6 +727,67 @@ async def reject_case(
                     "by": current_user["full_name"],
                     "role": current_user["role"],
                     "comments": request.comments or "Case rejected"
+                }
+            }
+        }
+    )
+    
+    updated_case = await db.kyc_cases.find_one({"_id": ObjectId(case_id)})
+    return case_helper(updated_case)
+
+@app.post("/api/cases/{case_id}/return-to-maker")
+async def return_to_maker(
+    case_id: str,
+    request: CaseActionRequest,
+    current_user: dict = Depends(get_current_user_with_db)
+):
+    """Return a case to MAKER for corrections (CHECKER only)"""
+    if current_user["role"] != "CHECKER":
+        raise HTTPException(status_code=403, detail="Only CHECKER can return cases to maker")
+    
+    if not ObjectId.is_valid(case_id):
+        raise HTTPException(status_code=400, detail="Invalid case ID")
+    
+    case = await db.kyc_cases.find_one({"_id": ObjectId(case_id)})
+    
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    
+    if case["created_by"] == current_user["id"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Cannot return your own case - Segregation of duties violation"
+        )
+    
+    if case["status"] not in [CaseStatus.SUBMITTED, CaseStatus.AI_REVIEWED]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot return case in {case['status']} status"
+        )
+    
+    if not request.comments:
+        raise HTTPException(
+            status_code=400,
+            detail="Comments are required when returning a case to maker"
+        )
+    
+    await db.kyc_cases.update_one(
+        {"_id": ObjectId(case_id)},
+        {
+            "$set": {
+                "status": CaseStatus.RETURNED_TO_MAKER,
+                "reviewed_by": current_user["id"],
+                "reviewed_by_name": current_user["full_name"],
+                "return_reason": request.comments,
+                "updated_at": datetime.utcnow()
+            },
+            "$push": {
+                "audit_trail": {
+                    "timestamp": datetime.utcnow(),
+                    "action": AuditAction.RETURNED_TO_MAKER,
+                    "by": current_user["full_name"],
+                    "role": current_user["role"],
+                    "comments": request.comments
                 }
             }
         }
